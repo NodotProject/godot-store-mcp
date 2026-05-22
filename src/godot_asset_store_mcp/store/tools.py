@@ -82,14 +82,41 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name="store_login",
         description=(
-            "Open a Chromium window so you can sign in to store.godotengine.org via "
-            "Keycloak SSO (including any reCAPTCHA challenge). After login succeeds the "
-            "tool captures the session cookie from the browser, stores it locally, and "
-            "closes the window. Requires `playwright` and a one-time "
+            "Sign in to store.godotengine.org by driving the Keycloak OIDC flow with "
+            "username and password. No browser required. If Keycloak demands "
+            "reCAPTCHA, 2FA, or another interactive step, the tool returns an error "
+            "pointing to `store_login_browser`."
+        ),
+    )
+    async def store_login(username: str, password: str) -> dict:
+        from godot_asset_store_mcp.store.oidc import (
+            InteractiveAuthRequired,
+            InvalidCredentials,
+            LoginError,
+            scripted_login,
+        )
+
+        try:
+            return await scripted_login(username, password)
+        except InvalidCredentials as e:
+            return {"error": True, "kind": "invalid_credentials", "message": str(e)}
+        except InteractiveAuthRequired as e:
+            return {"error": True, "kind": "interactive_required", "message": str(e)}
+        except LoginError as e:
+            return {"error": True, "kind": "login_error", "message": str(e)}
+
+    @mcp.tool(
+        name="store_login_browser",
+        description=(
+            "Fallback login: open a Chromium window so the user can sign in to "
+            "store.godotengine.org manually (handles captcha, 2FA, password resets, "
+            "etc.). The tool then captures the session cookie from the browser and "
+            "stores it locally. Requires the optional `browser` extra: "
+            "`pip install 'godot-asset-store-mcp[browser]'` and a one-time "
             "`python -m playwright install chromium`."
         ),
     )
-    async def store_login(
+    async def store_login_browser(
         timeout_seconds: Annotated[
             int,
             Field(

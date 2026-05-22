@@ -25,8 +25,13 @@ dependencies = [
     "lxml>=5.1",
     "platformdirs>=4.2",
     "pydantic>=2.6",
-    "playwright>=1.40",
 ]
+
+[project.optional-dependencies]
+# Required only if you want `store_login_browser` (Playwright-driven Chromium
+# fallback for captcha / 2FA flows). After installing this extra, also run:
+#   python -m playwright install chromium
+browser = ["playwright>=1.40"]
 
 [project.scripts]
 godot-asset-store-mcp = "godot_asset_store_mcp.__main__:main"

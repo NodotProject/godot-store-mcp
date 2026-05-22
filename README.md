@@ -21,7 +21,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# Only needed if you want to use store_login (browser-driven SSO):
+# Optional: only needed for the browser-fallback login tool
+# (used if Keycloak ever demands reCAPTCHA / 2FA / a required action):
+pip install -e '.[browser]'
 python -m playwright install chromium
 ```
 
@@ -79,8 +81,9 @@ Override the location with `GODOT_ASSET_STORE_MCP_CONFIG=/path/to/file.json`.
 | `store_search` | Free-text search (use `#tag` to search a tag). Supports pagination via `scroll`. |
 | `store_get_asset` | Fetch one asset by publisher slug + asset slug, including all download versions. |
 | `store_list_publisher_assets` | List every asset by a given publisher. |
-| `store_login` | Open a Chromium window for Keycloak SSO; capture the session cookie. |
-| `store_set_session_cookie` | Paste a `session` cookie value if browser login isn't viable. |
+| `store_login` | Sign in with username + password via the Keycloak OIDC flow (no browser). |
+| `store_login_browser` | Fallback: open a Chromium window for SSO. Use if `store_login` returns `interactive_required` (captcha / 2FA). Needs the `[browser]` extra. |
+| `store_set_session_cookie` | Paste a `session` cookie value if neither login flow is viable. |
 | `store_logout` | Clear the stored session cookie. |
 | `store_add_to_library` / `store_remove_from_library` | Library management on the new store. |
 | `store_download_asset` | Stream a specific version's zip from the CDN (or in-store endpoint). |
@@ -90,10 +93,11 @@ Override the location with `GODOT_ASSET_STORE_MCP_CONFIG=/path/to/file.json`.
 * The new store has no public JSON API yet. Tool implementations parse HTML,
   so selector or URL changes upstream will break things until the parser is
   updated.
-* Login uses Keycloak OIDC with potential reCAPTCHA. `store_login` launches a
-  visible Chromium window via Playwright so the human can solve any captcha;
-  the server then reads the resulting `session` cookie from the browser
-  context.
+* Login uses Keycloak OIDC. The default `store_login` tool does the whole
+  Authorization-Code flow in pure `httpx` with no browser. If Keycloak ever
+  enables reCAPTCHA, 2FA, or another required action, `store_login` returns
+  `interactive_required`; fall back to `store_login_browser` (Playwright)
+  or paste a cookie via `store_set_session_cookie`.
 * Asset URLs use slug pairs: `https://store.godotengine.org/asset/{publisher}/{slug}/`.
 
 ## License
