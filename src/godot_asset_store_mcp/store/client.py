@@ -54,9 +54,18 @@ class AssetStoreClient:
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
             headers = {"User-Agent": USER_AGENT, "Accept": "text/html, */*"}
-            cookies: dict[str, str] = {}
+            cookies = httpx.Cookies()
             if self._session_cookie:
-                cookies["session"] = self._session_cookie
+                # Bind the cookie to the store host so that server-issued
+                # Set-Cookie headers (Flask rotates `session` on every response)
+                # REPLACE our seed rather than coexisting as a second entry —
+                # otherwise the server reads the stale value and rejects writes.
+                cookies.set(
+                    "session",
+                    self._session_cookie,
+                    domain=self._host(),
+                    path="/",
+                )
             self._client = httpx.AsyncClient(
                 timeout=self._timeout,
                 follow_redirects=True,
@@ -225,6 +234,131 @@ class AssetStoreClient:
         return {"publisher": publisher, "results": results, "source_url": final_url}
 
     # ------------------------------------------------------- write actions
+
+    async def create_asset(
+        self,
+        *,
+        name: str,
+        url_slug: str,
+        publisher_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Create a new asset stub on the new store.
+
+        Posts the ``/asset/new/`` HTMX form: ``publisher_id`` + ``name`` +
+        ``url_slug`` + ``agree_terms`` plus the CSRF token scraped from a fresh
+        GET of the same page. The store creates a draft listing and 302s to
+        its detail/edit page — description, screenshots, versions, and download
+        archives must still be filled in via the web UI.
+
+        ``publisher_id`` defaults to the only existing publisher on the
+        account, or raises if there's more than one (the caller must pick).
+        """
+        client = self._ensure_client()
+        form_url = urljoin(self.base_url + "/", "asset/new/")
+        page = await client.get(form_url)
+        if page.status_code >= 400:
+            raise StoreError(page.status_code, page.text[:200])
+
+        soup = BeautifulSoup(page.text, "lxml")
+        form = next(
+            (
+                f
+                for f in soup.find_all("form")
+                if f.find("input", {"name": "csrf_token"})
+                and f.find(["select", "input"], {"name": "publisher_id"})
+            ),
+            None,
+        )
+        if form is None:
+            raise StoreError(
+                500,
+                "Could not locate the /asset/new/ form (page layout may have changed).",
+            )
+        csrf_input = form.find("input", {"name": "csrf_token"})
+        csrf_token = csrf_input.get("value") if csrf_input else None
+        if not csrf_token:
+            raise StoreError(500, "No CSRF token on /asset/new/ form.")
+
+        publisher_select = form.find("select", {"name": "publisher_id"})
+        publisher_options: list[dict[str, Any]] = []
+        if publisher_select is not None:
+            for opt in publisher_select.find_all("option"):
+                publisher_options.append(
+                    {
+                        "value": opt.get("value"),
+                        "label": opt.get_text(strip=True),
+                    }
+                )
+
+        if publisher_id is None:
+            existing = [
+                opt for opt in publisher_options if (opt["value"] or "").upper() != "NEW"
+            ]
+            if len(existing) == 1:
+                publisher_id = existing[0]["value"]
+            else:
+                raise StoreError(
+                    400,
+                    "publisher_id is required: multiple publishers (or none) "
+                    f"available — {publisher_options!r}",
+                )
+
+        data: dict[str, str] = {
+            "csrf_token": csrf_token,
+            "publisher_id": str(publisher_id),
+            "name": name,
+            "url_slug": url_slug,
+        }
+        # The terms checkbox / new-publisher fields only render when the user
+        # picks "Create a new publisher" (publisher_id=NEW). For existing
+        # publishers a real browser sends none of these — mirror that.
+        if str(publisher_id).upper() == "NEW":
+            data["agree_terms"] = "on"
+
+        # Send as multipart since the form declares enctype=multipart/form-data.
+        # httpx builds a valid multipart body when given `files={}` alongside
+        # `data=`. follow_redirects=False so we can inspect the redirect target
+        # — the store signals success either with a 30x Location header or, for
+        # HTMX-driven submits, a 200 carrying an `HX-Redirect` header.
+        response = await client.post(
+            form_url,
+            data=data,
+            files={},
+            headers={"Referer": form_url},
+            follow_redirects=False,
+        )
+
+        redirect_to = (
+            response.headers.get("hx-redirect")
+            or response.headers.get("location")
+            if response.status_code in (200, 301, 302, 303)
+            else None
+        )
+        if redirect_to and "/asset/" in redirect_to:
+            if redirect_to.startswith("/"):
+                redirect_to = urljoin(self.base_url + "/", redirect_to.lstrip("/"))
+            parts = [p for p in urlparse(redirect_to).path.split("/") if p]
+            publisher_slug = parts[1] if len(parts) >= 3 and parts[0] == "asset" else None
+            asset_slug = parts[2] if len(parts) >= 3 and parts[0] == "asset" else None
+            return {
+                "created": True,
+                "url": redirect_to,
+                "publisher_slug": publisher_slug,
+                "asset_slug": asset_slug,
+                "status": response.status_code,
+            }
+
+        # Validation failure: store re-renders the form with inline errors.
+        soup = BeautifulSoup(response.text, "lxml")
+        errors: list[str] = []
+        for el in soup.select(".error, .errors li, .alert-error, .invalid-feedback"):
+            text = el.get_text(" ", strip=True)
+            if text:
+                errors.append(text)
+        raise StoreError(
+            response.status_code,
+            "Asset creation rejected: " + ("; ".join(errors) or response.text[:200]),
+        )
 
     async def add_to_library(self, publisher: str, slug: str) -> dict[str, Any]:
         client = self._ensure_client()

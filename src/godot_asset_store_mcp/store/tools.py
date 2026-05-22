@@ -5,6 +5,7 @@ Most tools here scrape HTML — selectors may break as the beta store evolves.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urljoin
@@ -16,9 +17,30 @@ from godot_asset_store_mcp import config
 from godot_asset_store_mcp.download import stream_download
 from godot_asset_store_mcp.store.client import AssetStoreClient, StoreError
 
+ENV_USERNAME = "GODOT_ASSET_STORE_USERNAME"
+ENV_PASSWORD = "GODOT_ASSET_STORE_PASSWORD"
+
+_CREDENTIALS_REQUIRED_HINT = (
+    "No credentials available. To log in without exposing your password to the "
+    "assistant, ask the user to run\n"
+    "    godot-asset-store-mcp login-store\n"
+    "in their terminal — it prompts via getpass and saves the session cookie locally. "
+    f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
+    "environment and call this tool again with no arguments."
+)
+
 
 def _handle(err: StoreError) -> dict[str, Any]:
     return {"error": True, "status": err.status, "message": str(err)}
+
+
+def _resolve_credentials(
+    username: str | None, password: str | None
+) -> tuple[str | None, str | None]:
+    return (
+        username or os.environ.get(ENV_USERNAME) or None,
+        password or os.environ.get(ENV_PASSWORD) or None,
+    )
 
 
 def _client_from_creds() -> AssetStoreClient:
@@ -82,13 +104,40 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name="store_login",
         description=(
-            "Sign in to store.godotengine.org by driving the Keycloak OIDC flow with "
-            "username and password. No browser required. If Keycloak demands "
-            "reCAPTCHA, 2FA, or another interactive step, the tool returns an error "
-            "pointing to `store_login_browser`."
+            "Sign in to store.godotengine.org by driving the Keycloak OIDC flow. "
+            "No browser required. If Keycloak demands reCAPTCHA, 2FA, or another "
+            "interactive step, the tool returns an error pointing to "
+            "`store_login_browser`.\n\n"
+            "PREFERRED: do NOT ask the user for their password. Instead, instruct "
+            "them to run\n"
+            "    godot-asset-store-mcp login-store\n"
+            "in their terminal — credentials are prompted via getpass and never "
+            f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
+            "MCP server's environment and call this tool with no arguments. "
+            "Passing username/password as tool arguments still works but exposes "
+            "them to the LLM transcript — last resort only."
         ),
     )
-    async def store_login(username: str, password: str) -> dict:
+    async def store_login(
+        username: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional. Omit to read from "
+                    f"{ENV_USERNAME} or to prompt the user to run the CLI."
+                ),
+            ),
+        ] = None,
+        password: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional. Omit to read from "
+                    f"{ENV_PASSWORD} or to prompt the user to run the CLI."
+                ),
+            ),
+        ] = None,
+    ) -> dict:
         from godot_asset_store_mcp.store.oidc import (
             InteractiveAuthRequired,
             InvalidCredentials,
@@ -96,8 +145,16 @@ def register(mcp: FastMCP) -> None:
             scripted_login,
         )
 
+        resolved_user, resolved_pwd = _resolve_credentials(username, password)
+        if not resolved_user or not resolved_pwd:
+            return {
+                "error": True,
+                "kind": "credentials_required",
+                "message": _CREDENTIALS_REQUIRED_HINT,
+            }
+
         try:
-            return await scripted_login(username, password)
+            return await scripted_login(resolved_user, resolved_pwd)
         except InvalidCredentials as e:
             return {"error": True, "kind": "invalid_credentials", "message": str(e)}
         except InteractiveAuthRequired as e:
@@ -160,6 +217,43 @@ def register(mcp: FastMCP) -> None:
         return {"cleared": True}
 
     # -------------------------------------------------------- write actions
+
+    @mcp.tool(
+        name="store_create_asset",
+        description=(
+            "Create a new asset stub on the new store (requires login). Submits "
+            "the /asset/new/ form: publisher + name + url_slug + terms. The store "
+            "creates a draft listing and redirects to its edit page. Description, "
+            "screenshots, versions, and download archives must still be filled in "
+            "via the web UI afterwards. Returns the new asset's URL on success."
+        ),
+    )
+    async def store_create_asset(
+        name: Annotated[str, Field(description="Public asset title.")],
+        url_slug: Annotated[
+            str,
+            Field(description="URL slug (the path segment after the publisher in /asset/<pub>/<slug>/)."),
+        ],
+        publisher_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Numeric publisher id from the /asset/new/ form. Omit if you "
+                    "only have one publisher; the tool picks it automatically."
+                ),
+            ),
+        ] = None,
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.create_asset(
+                    name=name, url_slug=url_slug, publisher_id=publisher_id
+                )
+            except StoreError as e:
+                return _handle(e)
 
     @mcp.tool(
         name="store_add_to_library",

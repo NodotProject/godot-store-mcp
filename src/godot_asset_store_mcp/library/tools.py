@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -11,6 +12,18 @@ from pydantic import Field
 from godot_asset_store_mcp import config
 from godot_asset_store_mcp.download import stream_download
 from godot_asset_store_mcp.library.client import AssetLibraryClient, AssetLibraryError
+
+ENV_USERNAME = "GODOT_ASSET_LIBRARY_USERNAME"
+ENV_PASSWORD = "GODOT_ASSET_LIBRARY_PASSWORD"
+
+_CREDENTIALS_REQUIRED_HINT = (
+    "No credentials available. To log in without exposing your password to the "
+    "assistant, ask the user to run\n"
+    "    godot-asset-store-mcp login\n"
+    "in their terminal — it prompts via getpass and saves the token locally. "
+    f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
+    "environment and call this tool again with no arguments."
+)
 
 
 def _require_token() -> str:
@@ -24,6 +37,15 @@ def _require_token() -> str:
 
 def _handle(err: AssetLibraryError) -> dict[str, Any]:
     return {"error": True, "status": err.status, "payload": err.payload}
+
+
+def _resolve_credentials(
+    username: str | None, password: str | None
+) -> tuple[str | None, str | None]:
+    return (
+        username or os.environ.get(ENV_USERNAME) or None,
+        password or os.environ.get(ENV_PASSWORD) or None,
+    )
 
 
 def register(mcp: FastMCP) -> None:
@@ -74,7 +96,13 @@ def register(mcp: FastMCP) -> None:
         user: Annotated[str | None, Field(description="Submitter username.")] = None,
         cost: Annotated[str | None, Field(description="License filter, e.g. MIT.")] = None,
         godot_version: Annotated[
-            str | None, Field(description="Godot version, e.g. '4.3' or '4.3.1'.")
+            str | None,
+            Field(
+                description=(
+                    "Godot version, e.g. '4.3' or '4.3.1'. If omitted, defaults to '4.6' — "
+                    "the API otherwise legacy-defaults to 2.1, which hides nearly everything."
+                ),
+            ),
         ] = None,
         max_results: Annotated[
             int | None, Field(ge=1, le=500, description="Page size, 1-500.")
@@ -85,16 +113,21 @@ def register(mcp: FastMCP) -> None:
         ] = None,
         reverse: Annotated[bool, Field(description="Reverse sort order.")] = False,
     ) -> dict:
+        # The asset-library API has legacy defaults that surprise callers:
+        # missing `type` → `addon` only; missing `godot_version` → `2.1` only.
+        # Substitute sensible defaults so a bare search returns current assets.
+        effective_type = asset_type or "any"
+        effective_version = godot_version or "4.6"
         async with AssetLibraryClient() as c:
             try:
                 return await c.search_assets(
-                    asset_type=asset_type,
+                    asset_type=effective_type,
                     category=category,
                     support=support,
                     filter=query,
                     user=user,
                     cost=cost,
-                    godot_version=godot_version,
+                    godot_version=effective_version,
                     max_results=max_results,
                     page=page,
                     sort=sort,
@@ -119,21 +152,56 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name="library_login",
         description=(
-            "Log in to the old asset library and persist the returned token locally. "
-            "Subsequent write tools (edits, delete, review) use this token automatically."
+            "Authenticate to the old asset library and persist the returned token "
+            "locally. Subsequent write tools (edits, delete, review) use this token "
+            "automatically.\n\n"
+            "PREFERRED: do NOT ask the user for their password. Instead, instruct "
+            "them to run\n"
+            "    godot-asset-store-mcp login\n"
+            "in their terminal — credentials are prompted via getpass and never "
+            f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
+            "MCP server's environment and call this tool with no arguments. "
+            "Passing username/password as tool arguments still works but exposes "
+            "them to the LLM transcript — last resort only."
         ),
     )
-    async def library_login(username: str, password: str) -> dict:
+    async def library_login(
+        username: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional. Omit to read from "
+                    f"{ENV_USERNAME} or to prompt the user to run the CLI."
+                ),
+            ),
+        ] = None,
+        password: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional. Omit to read from "
+                    f"{ENV_PASSWORD} or to prompt the user to run the CLI."
+                ),
+            ),
+        ] = None,
+    ) -> dict:
+        resolved_user, resolved_pwd = _resolve_credentials(username, password)
+        if not resolved_user or not resolved_pwd:
+            return {
+                "error": True,
+                "kind": "credentials_required",
+                "message": _CREDENTIALS_REQUIRED_HINT,
+            }
         async with AssetLibraryClient() as c:
             try:
-                result = await c.login(username, password)
+                result = await c.login(resolved_user, resolved_pwd)
             except AssetLibraryError as e:
                 return _handle(e)
         token = result.get("token")
         if not token:
             return {"error": True, "payload": result}
         creds = config.load()
-        creds.library.username = result.get("username") or username
+        creds.library.username = result.get("username") or resolved_user
         creds.library.token = token
         path = config.save(creds)
         return {
