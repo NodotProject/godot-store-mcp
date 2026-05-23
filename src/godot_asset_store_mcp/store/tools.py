@@ -286,6 +286,271 @@ def register(mcp: FastMCP) -> None:
             except StoreError as e:
                 return _handle(e)
 
+    # ----------------------------------------------------------- manage tab
+
+    @mcp.tool(
+        name="store_suggest_tags",
+        description=(
+            "Query the store's tag autocomplete (/possible-tags/?q=) and return matching "
+            "tags as a list of {display_name, slug} entries. Useful for finding the canonical "
+            "slug to pass to store_edit_asset. Note: the store currently truncates both "
+            "display_name and slug at ~18 characters, so longer queries may come back trimmed."
+        ),
+    )
+    async def store_suggest_tags(
+        query: Annotated[str, Field(description="Free-text tag query.")],
+    ) -> dict:
+        async with _client_from_creds() as c:
+            try:
+                return {"query": query, "results": await c.suggest_tags(query)}
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_edit_asset",
+        description=(
+            "Patch the Settings tab of an asset you own. Any argument left as null/None "
+            "preserves the asset's current value (the tool re-reads the manage page to "
+            "fill in unchanged fields). To replace the tag set, pass `tags` as a list; "
+            "leave it None to keep the current tags. `type_` accepts 'addon' or 'project'. "
+            "Requires login."
+        ),
+    )
+    async def store_edit_asset(
+        publisher: str,
+        slug: str,
+        name: str | None = None,
+        description: Annotated[
+            str | None, Field(description="Short blurb (one or two sentences).")
+        ] = None,
+        body: Annotated[
+            str | None,
+            Field(description="Long description (markdown). Posted as `body_raw`."),
+        ] = None,
+        tags: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Replace the current tag list. Pass display names or slugs; "
+                    "the tool resolves each via /possible-tags/?q="
+                ),
+            ),
+        ] = None,
+        type_: Annotated[
+            str | None, Field(description="'addon' or 'project' (or the raw '0'/'1').")
+        ] = None,
+        license_predefined: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "License URL from the dropdown (e.g. "
+                    "'https://choosealicense.com/licenses/mit/'), or 'OTHER' to use "
+                    "the custom license_type/license_url fields."
+                ),
+            ),
+        ] = None,
+        license_type: str | None = None,
+        license_url: str | None = None,
+        source: Annotated[
+            str | None, Field(description="Public source URL (e.g. GitHub repo).")
+        ] = None,
+        uses_ai: bool | None = None,
+        uses_ai_reason: str | None = None,
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.edit_settings(
+                    publisher,
+                    slug,
+                    name=name,
+                    description=description,
+                    body=body,
+                    tags=tags,
+                    type_=type_,
+                    license_predefined=license_predefined,
+                    license_type=license_type,
+                    license_url=license_url,
+                    source=source,
+                    uses_ai=uses_ai,
+                    uses_ai_reason=uses_ai_reason,
+                )
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_update_media",
+        description=(
+            "Update the Media tab: upload a thumbnail and/or featured image, set the "
+            "YouTube video URL, and append screenshots. All file arguments are LOCAL "
+            "filesystem paths — fetch a remote image first (e.g. with `curl`) and pass "
+            "the resulting path. Existing screenshots are preserved by default. "
+            "Requires login."
+        ),
+    )
+    async def store_update_media(
+        publisher: str,
+        slug: str,
+        thumbnail_path: Annotated[
+            str | None,
+            Field(description="Local path to a thumbnail image. None = leave unchanged."),
+        ] = None,
+        featured_thumbnail_path: Annotated[
+            str | None,
+            Field(description="Local path to a wide/featured image. None = leave unchanged."),
+        ] = None,
+        clear_featured: Annotated[
+            bool, Field(description="Set true to remove the current featured image.")
+        ] = False,
+        video_url: Annotated[
+            str | None,
+            Field(description="YouTube URL, or '' to clear. None = leave unchanged."),
+        ] = None,
+        add_screenshots: Annotated[
+            list[str] | None,
+            Field(description="Local image paths to append to the screenshot gallery."),
+        ] = None,
+        keep_existing_screenshots: bool = True,
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.update_media(
+                    publisher,
+                    slug,
+                    thumbnail_path=thumbnail_path,
+                    featured_thumbnail_path=featured_thumbnail_path,
+                    clear_featured=clear_featured,
+                    video_url=video_url,
+                    add_screenshots=add_screenshots,
+                    keep_existing_screenshots=keep_existing_screenshots,
+                )
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_upload_version",
+        description=(
+            "Upload a new version archive (zip). Performs the three-step flow used by "
+            "the manage page: request a pre-signed S3 URL, PUT the file directly to S3, "
+            "then POST /version/create/ to commit. `file_path` must be a local zip; "
+            "fetch the GitHub archive first if necessary. Requires login."
+        ),
+    )
+    async def store_upload_version(
+        publisher: str,
+        slug: str,
+        file_path: Annotated[str, Field(description="Local path to the version zip.")],
+        version_name: Annotated[
+            str, Field(description="Version string shown to users, e.g. '0.1.9' or 'v0.3.3'.")
+        ],
+        changelog: str = "",
+        stable: bool = True,
+        min_godot_version: Annotated[
+            str,
+            Field(
+                description=(
+                    "Exact select option value, e.g. 'Godot 4.4' or 'Undefined'. "
+                    "Note: must be the full label (including 'Godot ' prefix)."
+                ),
+            ),
+        ] = "Undefined",
+        max_godot_version: str = "Undefined",
+        version_notes: str = "",
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.upload_version(
+                    publisher,
+                    slug,
+                    file_path=file_path,
+                    version_name=version_name,
+                    changelog=changelog,
+                    stable=stable,
+                    min_godot_version=min_godot_version,
+                    max_godot_version=max_godot_version,
+                    version_notes=version_notes,
+                )
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_get_pricing",
+        description=(
+            "Read the Pricing tab values (price_cent, reviews_disabled, donation_text, "
+            "donation_url) from the manage page. Requires login (must be able to manage "
+            "the asset)."
+        ),
+    )
+    async def store_get_pricing(publisher: str, slug: str) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.get_pricing(publisher, slug)
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_set_pricing",
+        description=(
+            "Update the Pricing tab (price in cents, reviews-disabled toggle, donation "
+            "fields). Pass None to leave a field unchanged. Requires login."
+        ),
+    )
+    async def store_set_pricing(
+        publisher: str,
+        slug: str,
+        price_cent: Annotated[
+            int | None,
+            Field(description="Price in cents (0 = free). None to leave unchanged."),
+        ] = None,
+        reviews_disabled: bool | None = None,
+        donation_text: str | None = None,
+        donation_url: str | None = None,
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.set_pricing(
+                    publisher,
+                    slug,
+                    price_cent=price_cent,
+                    reviews_disabled=reviews_disabled,
+                    donation_text=donation_text,
+                    donation_url=donation_url,
+                )
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_submit_for_review",
+        description=(
+            "Submit the asset to moderators for review (equivalent to clicking the "
+            "Publish button on the manage page). Once approved by a moderator the asset "
+            "becomes publicly visible. Requires login."
+        ),
+    )
+    async def store_submit_for_review(publisher: str, slug: str) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.submit_for_review(publisher, slug)
+            except StoreError as e:
+                return _handle(e)
+
     # ----------------------------------------------------------- downloads
 
     @mcp.tool(

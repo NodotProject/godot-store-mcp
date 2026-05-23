@@ -10,6 +10,9 @@ Flask app once OIDC has completed. Use ``store/login.py`` to obtain one.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -380,6 +383,524 @@ class AssetStoreClient:
             raise StoreError(response.status_code, response.text[:200])
         return {"removed": True, "status": response.status_code}
 
+    # ---------------------------------------------------- manage-page helpers
+
+    async def _fetch_manage(self, publisher: str, slug: str) -> BeautifulSoup:
+        """GET the /manage/ page and return its parsed soup.
+
+        Raises ``StoreError`` if not authenticated or the asset is unmanageable
+        by the current session.
+        """
+        soup, final_url = await self._get_html(f"/asset/{publisher}/{slug}/manage/")
+        if "/manage/" not in final_url:
+            # Server redirected away from the manage page → not authorized.
+            raise StoreError(403, f"Not authorized to manage {publisher}/{slug}.")
+        if not soup.find("input", {"name": "csrf_token"}):
+            raise StoreError(401, "No CSRF token on manage page; session may be expired.")
+        return soup
+
+    @staticmethod
+    def _csrf_token(soup: BeautifulSoup) -> str:
+        token = soup.find("input", {"name": "csrf_token"})
+        if not token or not token.get("value"):
+            raise StoreError(500, "csrf_token input missing on manage page.")
+        return token["value"]
+
+    @staticmethod
+    def _form_errors(html: str) -> list[str]:
+        soup = BeautifulSoup(html, "lxml")
+        errors: list[str] = []
+        for el in soup.select(".error, .errors li, .alert-error, .invalid-feedback, .request-error"):
+            text = el.get_text(" ", strip=True)
+            if text:
+                errors.append(text)
+        return errors
+
+    async def _post_manage_form(
+        self,
+        endpoint: str,
+        data: dict[str, str],
+        files: dict[str, Any] | None = None,
+        *,
+        publisher: str,
+        slug: str,
+    ) -> dict[str, Any]:
+        client = self._ensure_client()
+        url = urljoin(self.base_url + "/", endpoint.lstrip("/"))
+        referer = urljoin(self.base_url + "/", f"asset/{publisher}/{slug}/manage/")
+        # All HTMX-driven manage forms expect a multipart body.
+        files = files or {}
+        response = await client.post(
+            url,
+            data=data,
+            files=files,
+            headers={"Referer": referer, "HX-Request": "true"},
+            follow_redirects=False,
+        )
+        ok = 200 <= response.status_code < 300
+        if not ok:
+            errors = self._form_errors(response.text)
+            raise StoreError(
+                response.status_code,
+                "; ".join(errors) or response.text[:300] or "no response body",
+            )
+        # The HTML fragment returned IS the new tab content — surface inline
+        # errors even on 200 OK so callers don't have to re-fetch to detect them.
+        errors = self._form_errors(response.text)
+        return {
+            "ok": True,
+            "status": response.status_code,
+            "endpoint": endpoint,
+            "errors": errors,
+        }
+
+    # ---------------------------------------------------- tag autocomplete
+
+    async def suggest_tags(self, query: str) -> list[dict[str, str]]:
+        client = self._ensure_client()
+        url = urljoin(self.base_url + "/", "possible-tags/")
+        response = await client.get(url, params={"q": query})
+        if response.status_code >= 400:
+            raise StoreError(response.status_code, response.text[:200])
+        return list(response.json())
+
+    async def _resolve_tag_slug(self, tag: str) -> str:
+        """Resolve a free-text tag into the store's canonical slug.
+
+        Tries the autocomplete endpoint and picks an exact match on either the
+        slug or the display name (case-insensitive). Falls back to the input.
+        """
+        suggestions = await self.suggest_tags(tag)
+        lowered = tag.lower()
+        for s in suggestions:
+            if s.get("slug", "").lower() == lowered or s.get("display_name", "").lower() == lowered:
+                return s["slug"]
+        # No exact match — return the user's input verbatim so the server can
+        # decide whether to accept (it does accept arbitrary slugs).
+        return tag
+
+    # ---------------------------------------------------- settings tab
+
+    @staticmethod
+    def _scrape_settings(soup: BeautifulSoup) -> dict[str, Any]:
+        """Extract the current values of the Settings form so callers can patch
+        a subset of fields without overwriting the rest with empty strings."""
+        settings_form = next(
+            (
+                f
+                for f in soup.find_all("form")
+                if f.get("hx-post", "").endswith("/settings/update/")
+            ),
+            None,
+        )
+        if settings_form is None:
+            raise StoreError(500, "Settings form not found on manage page.")
+        out: dict[str, Any] = {}
+        for inp in settings_form.find_all(["input", "textarea", "select"]):
+            name = inp.get("name")
+            if not name or name == "csrf_token":
+                continue
+            if inp.name == "textarea":
+                text = inp.get_text() or ""
+                # HTML5 textarea parsing strips a single leading LF in the
+                # element's content — BeautifulSoup doesn't, so each round-trip
+                # would otherwise prepend another newline. Mirror the spec.
+                if text.startswith("\n"):
+                    text = text[1:]
+                out[name] = text
+            elif inp.name == "select":
+                selected = inp.find("option", selected=True)
+                out[name] = selected.get("value", "") if selected else ""
+            elif inp.get("type") == "checkbox":
+                out[name] = "y" if inp.has_attr("checked") else ""
+            else:
+                out[name] = inp.get("value", "") or ""
+        existing_tag_slugs: list[str] = []
+        for tag_input in settings_form.select(".tag-data"):
+            v = tag_input.get("value")
+            if v:
+                existing_tag_slugs.append(v)
+        out["_existing_tags"] = existing_tag_slugs
+        return out
+
+    async def edit_settings(
+        self,
+        publisher: str,
+        slug: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        body: str | None = None,
+        tags: list[str] | None = None,
+        type_: str | None = None,
+        license_predefined: str | None = None,
+        license_type: str | None = None,
+        license_url: str | None = None,
+        source: str | None = None,
+        uses_ai: bool | None = None,
+        uses_ai_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Patch the Settings tab. Only fields explicitly passed are changed —
+        the rest are read from the current manage page and re-submitted so the
+        server-side validator sees a full form."""
+        soup = await self._fetch_manage(publisher, slug)
+        csrf = self._csrf_token(soup)
+        current = self._scrape_settings(soup)
+
+        # Type translation: accept "addon"/"project" as friendlier aliases.
+        if type_ is not None:
+            type_value = {"addon": "0", "project": "1"}.get(type_, str(type_))
+        else:
+            type_value = current.get("type", "0")
+
+        data: dict[str, str] = {
+            "csrf_token": csrf,
+            "name": name if name is not None else current.get("name", ""),
+            "description": description if description is not None else current.get("description", ""),
+            "body_raw": body if body is not None else current.get("body_raw", ""),
+            "type": type_value,
+            "license_predefined": (
+                license_predefined
+                if license_predefined is not None
+                else current.get("license_predefined", "")
+            ),
+            "license_type": (
+                license_type if license_type is not None else current.get("license_type", "")
+            ),
+            "license_url": (
+                license_url if license_url is not None else current.get("license_url", "")
+            ),
+            "source": source if source is not None else current.get("source", ""),
+        }
+        if uses_ai is not None:
+            if uses_ai:
+                data["uses_ai"] = "y"
+        elif current.get("uses_ai") == "y":
+            data["uses_ai"] = "y"
+        data["uses_ai_reason"] = (
+            uses_ai_reason if uses_ai_reason is not None else current.get("uses_ai_reason", "")
+        )
+
+        # Tags: if caller passed `tags`, REPLACE the current set; otherwise
+        # preserve whatever was already on the asset.
+        slugs: list[str]
+        if tags is not None:
+            slugs = []
+            for raw in tags:
+                resolved = await self._resolve_tag_slug(raw)
+                if resolved and resolved not in slugs:
+                    slugs.append(resolved)
+        else:
+            slugs = current.get("_existing_tags", []) or []
+        for i, s in enumerate(slugs, start=1):
+            data[f"tags-{i}"] = s
+
+        return await self._post_manage_form(
+            f"asset/{publisher}/{slug}/settings/update/",
+            data,
+            publisher=publisher,
+            slug=slug,
+        )
+
+    # ---------------------------------------------------- media tab
+
+    @staticmethod
+    def _scrape_existing_media_ids(soup: BeautifulSoup) -> list[str]:
+        """Return the existing screenshot/media item ids in current display order."""
+        ids: list[str] = []
+        for item in soup.select('.media-manager .media-item[data-type="existing"]'):
+            order = item.find("input", {"name": lambda n: bool(n and n.startswith("media_order"))})
+            if order and order.get("value"):
+                ids.append(order["value"])
+        return ids
+
+    async def update_media(
+        self,
+        publisher: str,
+        slug: str,
+        *,
+        thumbnail_path: str | Path | None = None,
+        featured_thumbnail_path: str | Path | None = None,
+        clear_featured: bool = False,
+        video_url: str | None = None,
+        add_screenshots: list[str | Path] | None = None,
+        keep_existing_screenshots: bool = True,
+    ) -> dict[str, Any]:
+        """POST the /media/update/ form.
+
+        - ``thumbnail_path`` / ``featured_thumbnail_path``: local file paths to
+          upload. Leave ``None`` to keep the current value.
+        - ``clear_featured``: explicitly remove the existing featured image.
+        - ``video_url``: YouTube URL or ``""`` to clear; ``None`` to keep.
+        - ``add_screenshots``: list of local files to append to the screenshot
+          gallery. The existing screenshots are kept (in their current order)
+          unless ``keep_existing_screenshots=False``.
+        """
+        soup = await self._fetch_manage(publisher, slug)
+        csrf = self._csrf_token(soup)
+
+        # Default values from existing form
+        media_form = next(
+            (f for f in soup.find_all("form") if f.get("hx-post", "").endswith("/media/update/")),
+            None,
+        )
+        current_video = ""
+        if media_form is not None:
+            video_input = media_form.find("input", {"name": "video"})
+            if video_input is not None:
+                current_video = video_input.get("value", "") or ""
+
+        existing_ids = self._scrape_existing_media_ids(soup) if keep_existing_screenshots else []
+
+        data: dict[str, str] = {
+            "csrf_token": csrf,
+            "video": video_url if video_url is not None else current_video,
+            "thumbnail_updated": "true" if thumbnail_path is not None else "false",
+            "featured_thumbnail_updated": (
+                "true" if (featured_thumbnail_path is not None or clear_featured) else "false"
+            ),
+        }
+
+        files: dict[str, Any] = {}
+        if thumbnail_path is not None:
+            p = Path(thumbnail_path)
+            files["thumbnail"] = (p.name, p.read_bytes(), _guess_mime(p))
+        if featured_thumbnail_path is not None:
+            p = Path(featured_thumbnail_path)
+            files["featured_thumbnail"] = (p.name, p.read_bytes(), _guess_mime(p))
+
+        # Reorder + add screenshots. The form indexes media_order from 0 and
+        # references new uploads as "NEW::<upload-index>".
+        order_index = 0
+        for existing_id in existing_ids:
+            data[f"media_order-{order_index}"] = existing_id
+            order_index += 1
+        for upload_index, path in enumerate(add_screenshots or []):
+            p = Path(path)
+            files_key = f"new_uploads-{upload_index}"
+            files[files_key] = (p.name, p.read_bytes(), _guess_mime(p))
+            data[f"media_order-{order_index}"] = f"NEW::{upload_index}"
+            order_index += 1
+
+        return await self._post_manage_form(
+            f"asset/{publisher}/{slug}/media/update/",
+            data,
+            files=files,
+            publisher=publisher,
+            slug=slug,
+        )
+
+    # ---------------------------------------------------- version upload
+
+    async def upload_version(
+        self,
+        publisher: str,
+        slug: str,
+        *,
+        file_path: str | Path,
+        version_name: str,
+        changelog: str = "",
+        stable: bool = True,
+        min_godot_version: str = "Undefined",
+        max_godot_version: str = "Undefined",
+        version_notes: str = "",
+    ) -> dict[str, Any]:
+        """Upload a new version archive.
+
+        Three steps, mirroring the upstream JS:
+
+        1. POST /version/upload_url/ — returns ``{upload_url, queue_id}``.
+        2. PUT the file body directly to that S3 pre-signed URL.
+        3. POST /version/create/ to commit the upload.
+        """
+        soup = await self._fetch_manage(publisher, slug)
+        csrf = self._csrf_token(soup)
+
+        path = Path(file_path)
+        body = path.read_bytes()
+        md5 = hashlib.md5(body).digest()
+        checksum_b64 = base64.b64encode(md5).decode()
+
+        common: dict[str, str] = {
+            "csrf_token": csrf,
+            "name": version_name,
+            "changelog": changelog,
+            "min_godot_version": min_godot_version,
+            "max_godot_version": max_godot_version,
+            "version_notes": version_notes,
+        }
+        if stable:
+            common["stable"] = "y"
+
+        client = self._ensure_client()
+        manage_url = urljoin(self.base_url + "/", f"asset/{publisher}/{slug}/manage/")
+
+        # Step 1
+        upload_url_endpoint = urljoin(
+            self.base_url + "/", f"asset/{publisher}/{slug}/version/upload_url/"
+        )
+        step1 = await client.post(
+            upload_url_endpoint,
+            data={**common, "filename": path.name, "checksum": checksum_b64},
+            files={},
+            headers={
+                "X-CSRFToken": csrf,
+                "Referer": manage_url,
+                "HX-Request": "true",
+            },
+            follow_redirects=False,
+        )
+        if step1.status_code >= 400:
+            try:
+                err = step1.json().get("error") or step1.text[:300]
+            except ValueError:
+                err = step1.text[:300]
+            raise StoreError(step1.status_code, f"version/upload_url rejected: {err}")
+        try:
+            payload = step1.json()
+        except ValueError as e:
+            raise StoreError(500, f"version/upload_url returned non-JSON: {step1.text[:200]}") from e
+        upload_url = payload.get("upload_url")
+        queue_id = payload.get("queue_id")
+        if not upload_url or not queue_id:
+            raise StoreError(500, f"version/upload_url missing fields: {payload!r}")
+
+        # Step 2 — direct PUT to S3 pre-signed URL. The pre-signed URL embeds
+        # auth; we must NOT send the store's session cookie or our default
+        # User-Agent could trip the signature.
+        async with httpx.AsyncClient(timeout=600.0) as raw:
+            put_resp = await raw.put(
+                upload_url,
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        if put_resp.status_code >= 400:
+            raise StoreError(put_resp.status_code, f"S3 upload failed: {put_resp.text[:300]}")
+
+        # Step 3
+        create_endpoint = urljoin(
+            self.base_url + "/", f"asset/{publisher}/{slug}/version/create/"
+        )
+        step3 = await client.post(
+            create_endpoint,
+            data={**common, "queue_id": str(queue_id)},
+            files={},
+            headers={
+                "X-CSRFToken": csrf,
+                "Referer": manage_url,
+                "HX-Request": "true",
+            },
+            follow_redirects=False,
+        )
+        if step3.status_code >= 400:
+            try:
+                err = step3.json().get("error") or step3.text[:300]
+            except ValueError:
+                err = step3.text[:300]
+            raise StoreError(step3.status_code, f"version/create rejected: {err}")
+
+        return {
+            "ok": True,
+            "queue_id": queue_id,
+            "filename": path.name,
+            "checksum_b64": checksum_b64,
+            "size": len(body),
+            "version_name": version_name,
+        }
+
+    # ---------------------------------------------------- pricing
+
+    @staticmethod
+    def _parse_pricing_form(soup: BeautifulSoup) -> dict[str, str]:
+        pricing_form = next(
+            (
+                f
+                for f in soup.find_all("form")
+                if f.get("hx-post", "").endswith("/pricing/update/")
+            ),
+            None,
+        )
+        current: dict[str, str] = {}
+        if pricing_form is None:
+            return current
+        for inp in pricing_form.find_all("input"):
+            n = inp.get("name")
+            if not n or n == "csrf_token":
+                continue
+            if inp.get("type") == "checkbox":
+                current[n] = "y" if inp.has_attr("checked") else ""
+            else:
+                current[n] = inp.get("value", "") or ""
+        return current
+
+    async def get_pricing(self, publisher: str, slug: str) -> dict[str, Any]:
+        soup = await self._fetch_manage(publisher, slug)
+        current = self._parse_pricing_form(soup)
+        raw_price = current.get("price_cent", "")
+        try:
+            price_cent = int(raw_price) if raw_price != "" else 0
+        except ValueError:
+            price_cent = None
+        return {
+            "publisher_slug": publisher,
+            "asset_slug": slug,
+            "price_cent": price_cent,
+            "reviews_disabled": current.get("reviews_disabled") == "y",
+            "donation_text": current.get("donation_text", ""),
+            "donation_url": current.get("donation_url", ""),
+        }
+
+    async def set_pricing(
+        self,
+        publisher: str,
+        slug: str,
+        *,
+        price_cent: int | None = None,
+        reviews_disabled: bool | None = None,
+        donation_text: str | None = None,
+        donation_url: str | None = None,
+    ) -> dict[str, Any]:
+        soup = await self._fetch_manage(publisher, slug)
+        csrf = self._csrf_token(soup)
+        current = self._parse_pricing_form(soup)
+
+        data: dict[str, str] = {
+            "csrf_token": csrf,
+            "price_cent": (
+                "" if price_cent is None else str(price_cent)
+            ) if price_cent is not None else current.get("price_cent", ""),
+            "donation_text": (
+                donation_text if donation_text is not None else current.get("donation_text", "")
+            ),
+            "donation_url": (
+                donation_url if donation_url is not None else current.get("donation_url", "")
+            ),
+        }
+        if reviews_disabled is None:
+            if current.get("reviews_disabled") == "y":
+                data["reviews_disabled"] = "y"
+        elif reviews_disabled:
+            data["reviews_disabled"] = "y"
+
+        return await self._post_manage_form(
+            f"asset/{publisher}/{slug}/pricing/update/",
+            data,
+            publisher=publisher,
+            slug=slug,
+        )
+
+    # ---------------------------------------------------- submit for review
+
+    async def submit_for_review(self, publisher: str, slug: str) -> dict[str, Any]:
+        soup = await self._fetch_manage(publisher, slug)
+        csrf = self._csrf_token(soup)
+        return await self._post_manage_form(
+            f"asset/{publisher}/{slug}/update_status/",
+            {"csrf_token": csrf, "action": "mark_public"},
+            publisher=publisher,
+            slug=slug,
+        )
+
     async def resolve_download_url(
         self, publisher: str, slug: str, download_id: str | None = None
     ) -> str:
@@ -406,3 +927,17 @@ class AssetStoreClient:
         return urlunparse(
             urlparse(urljoin(self.base_url + "/", f"asset/{publisher}/{slug}/download/{chosen['id']}/"))
         )
+
+
+_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".zip": "application/zip",
+}
+
+
+def _guess_mime(path: Path) -> str:
+    return _MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
