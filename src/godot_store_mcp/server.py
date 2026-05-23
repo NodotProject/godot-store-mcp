@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from godot_asset_store_mcp.library import tools as library_tools
-from godot_asset_store_mcp.store import tools as store_tools
+from godot_store_mcp.library import tools as library_tools
+from godot_store_mcp.store import tools as store_tools
 
 mcp = FastMCP(
-    name="godot-asset-store",
+    name="godot-store",
     instructions=(
         "Browse, authenticate against, and download from the Godot asset library "
         "(godotengine.org/asset-library) and the new Godot Asset Store "

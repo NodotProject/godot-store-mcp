@@ -13,9 +13,9 @@ from urllib.parse import urljoin
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from godot_asset_store_mcp import config
-from godot_asset_store_mcp.download import stream_download
-from godot_asset_store_mcp.store.client import AssetStoreClient, StoreError
+from godot_store_mcp import config
+from godot_store_mcp.download import stream_download
+from godot_store_mcp.store.client import AssetStoreClient, StoreError
 
 ENV_USERNAME = "GODOT_ASSET_STORE_USERNAME"
 ENV_PASSWORD = "GODOT_ASSET_STORE_PASSWORD"
@@ -23,7 +23,7 @@ ENV_PASSWORD = "GODOT_ASSET_STORE_PASSWORD"
 _CREDENTIALS_REQUIRED_HINT = (
     "No credentials available. To log in without exposing your password to the "
     "assistant, ask the user to run\n"
-    "    godot-asset-store-mcp login-store\n"
+    "    godot-store-mcp login-store\n"
     "in their terminal — it prompts via getpass and saves the session cookie locally. "
     f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
     "environment and call this tool again with no arguments."
@@ -110,7 +110,7 @@ def register(mcp: FastMCP) -> None:
             "`store_login_browser`.\n\n"
             "PREFERRED: do NOT ask the user for their password. Instead, instruct "
             "them to run\n"
-            "    godot-asset-store-mcp login-store\n"
+            "    godot-store-mcp login-store\n"
             "in their terminal — credentials are prompted via getpass and never "
             f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
             "MCP server's environment and call this tool with no arguments. "
@@ -138,7 +138,7 @@ def register(mcp: FastMCP) -> None:
             ),
         ] = None,
     ) -> dict:
-        from godot_asset_store_mcp.store.oidc import (
+        from godot_store_mcp.store.oidc import (
             InteractiveAuthRequired,
             InvalidCredentials,
             LoginError,
@@ -169,7 +169,7 @@ def register(mcp: FastMCP) -> None:
             "store.godotengine.org manually (handles captcha, 2FA, password resets, "
             "etc.). The tool then captures the session cookie from the browser and "
             "stores it locally. Requires the optional `browser` extra: "
-            "`pip install 'godot-asset-store-mcp[browser]'` and a one-time "
+            "`pip install 'godot-store-mcp[browser]'` and a one-time "
             "`python -m playwright install chromium`."
         ),
     )
@@ -183,7 +183,7 @@ def register(mcp: FastMCP) -> None:
             ),
         ] = 600,
     ) -> dict:
-        from godot_asset_store_mcp.store.login import interactive_login
+        from godot_store_mcp.store.login import interactive_login
 
         try:
             return await interactive_login(timeout_seconds=timeout_seconds)

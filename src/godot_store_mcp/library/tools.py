@@ -9,9 +9,9 @@ from typing import Annotated, Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from godot_asset_store_mcp import config
-from godot_asset_store_mcp.download import stream_download
-from godot_asset_store_mcp.library.client import AssetLibraryClient, AssetLibraryError
+from godot_store_mcp import config
+from godot_store_mcp.download import stream_download
+from godot_store_mcp.library.client import AssetLibraryClient, AssetLibraryError
 
 ENV_USERNAME = "GODOT_ASSET_LIBRARY_USERNAME"
 ENV_PASSWORD = "GODOT_ASSET_LIBRARY_PASSWORD"
@@ -19,7 +19,7 @@ ENV_PASSWORD = "GODOT_ASSET_LIBRARY_PASSWORD"
 _CREDENTIALS_REQUIRED_HINT = (
     "No credentials available. To log in without exposing your password to the "
     "assistant, ask the user to run\n"
-    "    godot-asset-store-mcp login\n"
+    "    godot-store-mcp login\n"
     "in their terminal — it prompts via getpass and saves the token locally. "
     f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
     "environment and call this tool again with no arguments."
@@ -157,7 +157,7 @@ def register(mcp: FastMCP) -> None:
             "automatically.\n\n"
             "PREFERRED: do NOT ask the user for their password. Instead, instruct "
             "them to run\n"
-            "    godot-asset-store-mcp login\n"
+            "    godot-store-mcp login\n"
             "in their terminal — credentials are prompted via getpass and never "
             f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
             "MCP server's environment and call this tool with no arguments. "

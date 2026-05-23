@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 
 DEFAULT_BASE_URL = "https://store.godotengine.org"
 DEFAULT_TIMEOUT = 30.0
-USER_AGENT = "godot-asset-store-mcp/0.1 (+https://github.com/jakecattrall/godot-asset-store-mcp)"
+USER_AGENT = "godot-store-mcp/0.1 (+https://github.com/NodotProject/godot-store-mcp)"
 
 
 class StoreError(RuntimeError):

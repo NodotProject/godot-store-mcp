@@ -3,13 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "godot-asset-store-mcp"
+name = "godot-store-mcp"
 version = "0.1.0"
 description = "MCP server for the Godot asset library (godotengine.org/asset-library) and the new Godot Asset Store (store.godotengine.org)."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "Jake Cattrall" }]
+maintainers = [{ name = "NodotProject" }]
 keywords = ["mcp", "godot", "asset-library", "asset-store", "model-context-protocol"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -34,17 +35,18 @@ dependencies = [
 browser = ["playwright>=1.40"]
 
 [project.scripts]
-godot-asset-store-mcp = "godot_asset_store_mcp.__main__:main"
+godot-store-mcp = "godot_store_mcp.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/jakecattrall/godot-asset-store-mcp"
-Issues = "https://github.com/jakecattrall/godot-asset-store-mcp/issues"
+Homepage = "https://github.com/NodotProject/godot-store-mcp"
+Issues = "https://github.com/NodotProject/godot-store-mcp/issues"
+Repository = "https://github.com/NodotProject/godot-store-mcp"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/godot_asset_store_mcp"]
+packages = ["src/godot_store_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/godot_asset_store_mcp", "README.md", "LICENSE"]
+include = ["src/godot_store_mcp", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from godot_asset_store_mcp import config
+from godot_store_mcp import config
 
 LOGIN_URL = "https://store.godotengine.org/login"
 STORE_HOST = "store.godotengine.org"

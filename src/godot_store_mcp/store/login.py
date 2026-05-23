@@ -11,9 +11,10 @@ the window.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from urllib.parse import urlparse
 
-from godot_asset_store_mcp import config
+from godot_store_mcp import config
 
 LOGIN_URL = "https://store.godotengine.org/login"
 STORE_HOST = "store.godotengine.org"
@@ -46,10 +47,8 @@ async def interactive_login(timeout_seconds: int = 600) -> dict:
             ) from e
         context = await browser.new_context()
         page = await context.new_page()
-        try:
+        with contextlib.suppress(PWTimeoutError):
             await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        except PWTimeoutError:
-            pass
 
         deadline = asyncio.get_event_loop().time() + timeout_seconds
         captured_cookie: str | None = None

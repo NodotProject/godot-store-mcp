@@ -9,6 +9,7 @@ with mode 600. Two backends share the same file:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -17,7 +18,7 @@ from typing import Any
 
 from platformdirs import user_config_dir
 
-APP_NAME = "godot-asset-store-mcp"
+APP_NAME = "godot-store-mcp"
 
 
 @dataclass
@@ -51,7 +52,7 @@ class Credentials:
 
 
 def config_path() -> Path:
-    override = os.environ.get("GODOT_ASSET_STORE_MCP_CONFIG")
+    override = os.environ.get("GODOT_STORE_MCP_CONFIG")
     if override:
         return Path(override).expanduser()
     return Path(user_config_dir(APP_NAME)) / "credentials.json"
@@ -73,11 +74,9 @@ def save(creds: Credentials) -> Path:
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(creds.to_dict(), indent=2), encoding="utf-8")
     os.replace(tmp, path)
-    try:
+    # Best effort — Windows or unusual filesystems may not support chmod.
+    with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
-    except OSError:
-        # Best effort — Windows or unusual filesystems.
-        pass
     return path
 
 

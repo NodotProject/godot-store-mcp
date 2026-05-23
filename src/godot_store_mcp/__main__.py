@@ -4,8 +4,8 @@ Run with no arguments to start the FastMCP server over stdio. Run with a
 subcommand to authenticate interactively in the terminal — credentials are
 prompted locally via :mod:`getpass` and never pass through an LLM:
 
-* ``godot-asset-store-mcp login``       — old asset library
-* ``godot-asset-store-mcp login-store`` — new asset store (OIDC)
+* ``godot-store-mcp login``       — old asset library
+* ``godot-store-mcp login-store`` — new asset store (OIDC)
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="godot-asset-store-mcp",
+        prog="godot-store-mcp",
         description=(
             "MCP server for the Godot asset library and the new Godot Asset Store. "
             "Run with no arguments to start the MCP server over stdio."
@@ -47,7 +47,7 @@ def main() -> None:
         sys.exit(asyncio.run(_cli_store_login()))
 
     # Default: run the MCP server over stdio.
-    from godot_asset_store_mcp.server import mcp
+    from godot_store_mcp.server import mcp
 
     mcp.run()
 
@@ -74,8 +74,8 @@ def _prompt_credentials(label: str) -> tuple[str, str] | None:
 
 
 async def _cli_library_login() -> int:
-    from godot_asset_store_mcp import config
-    from godot_asset_store_mcp.library.client import AssetLibraryClient, AssetLibraryError
+    from godot_store_mcp import config
+    from godot_store_mcp.library.client import AssetLibraryClient, AssetLibraryError
 
     prompted = _prompt_credentials("godotengine.org/asset-library (old library)")
     if prompted is None:
@@ -103,7 +103,7 @@ async def _cli_library_login() -> int:
 
 
 async def _cli_store_login() -> int:
-    from godot_asset_store_mcp.store.oidc import (
+    from godot_store_mcp.store.oidc import (
         InteractiveAuthRequired,
         InvalidCredentials,
         LoginError,
@@ -123,7 +123,7 @@ async def _cli_store_login() -> int:
     except InteractiveAuthRequired as e:
         print(
             f"{e}\n\nTry the browser-driven flow instead:\n"
-            "    pip install 'godot-asset-store-mcp[browser]'\n"
+            "    pip install 'godot-store-mcp[browser]'\n"
             "    python -m playwright install chromium\n"
             "then call store_login_browser via the MCP server.",
             file=sys.stderr,

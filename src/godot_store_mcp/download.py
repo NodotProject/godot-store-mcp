@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -75,10 +76,8 @@ async def stream_download(
 
     digest = sha.hexdigest()
     if expected_sha256 and expected_sha256.lower() != digest:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(target)
-        except OSError:
-            pass
         raise ValueError(
             f"sha256 mismatch for {url}: expected {expected_sha256}, got {digest}"
         )
