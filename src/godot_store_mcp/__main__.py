@@ -4,8 +4,11 @@ Run with no arguments to start the FastMCP server over stdio. Run with a
 subcommand to authenticate interactively in the terminal — credentials are
 prompted locally via :mod:`getpass` and never pass through an LLM:
 
-* ``godot-store-mcp login``       — old asset library
-* ``godot-store-mcp login-store`` — new asset store (OIDC)
+* ``godot-store-mcp login``       — old asset library (godotengine.org/asset-library)
+* ``godot-store-mcp login-store`` — new asset store (store.godotengine.org, OIDC)
+
+Use these when your MCP client does not support interactive elicitation (so the
+``library_login`` / ``store_login`` tools can't prompt you securely in-client).
 """
 
 from __future__ import annotations

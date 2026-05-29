@@ -94,7 +94,32 @@ class AssetStoreClient:
         response = await client.get(url, params=params)
         if response.status_code >= 400:
             raise StoreError(response.status_code, response.text[:200])
+        self._raise_if_auth_redirect(url, str(response.url))
         return BeautifulSoup(response.text, "lxml"), str(response.url)
+
+    @staticmethod
+    def _raise_if_auth_redirect(requested: str, final: str) -> None:
+        """Detect a silent login redirect.
+
+        Authenticated pages 302 to ``/login`` which then bounces to the
+        Keycloak SSO host. Because the client follows redirects, the response
+        is HTTP 200 for the *login* page — without this guard the scraper would
+        parse that page as if it were the requested one and return phantom data
+        (e.g. a lone ``/asset/new/`` card) instead of surfacing the auth error.
+        """
+        final_parsed = urlparse(final)
+        landed_on_login = (
+            final_parsed.path.rstrip("/").endswith("/login")
+            or final_parsed.hostname == "sso.godotengine.org"
+            or "/openid-connect/auth" in final_parsed.path
+        )
+        # Only treat it as an error if we did not actually ask for the login page.
+        if landed_on_login and "/login" not in urlparse(requested).path:
+            raise StoreError(
+                401,
+                "not authenticated: the store redirected to login. The stored "
+                "session has expired — re-run store_login (or store_login_browser).",
+            )
 
     # ---------------------------------------------------------------- parse
 
@@ -222,19 +247,45 @@ class AssetStoreClient:
             "download_url_template": download_template,
         }
 
-    async def list_publisher_assets(self, publisher: str) -> dict[str, Any]:
-        soup, final_url = await self._get_html(f"/publisher/{publisher}/")
-        cards = soup.select("a[href^='/asset/']")
+    # Action links under /asset/ that are not actual asset listings.
+    _NON_ASSET_SLUGS = {"new", "manage", "edit"}
+
+    def _is_asset_href(self, href: str) -> bool:
+        parts = [p for p in (href or "").split("/") if p]
+        # Expect /asset/<publisher>/<slug>/... — at least 3 segments and the
+        # second segment must not be an action keyword like "new".
+        return (
+            len(parts) >= 3
+            and parts[0] == "asset"
+            and parts[1] not in self._NON_ASSET_SLUGS
+        )
+
+    def _scrape_asset_links(self, soup: BeautifulSoup) -> list[dict[str, Any]]:
         seen: set[str] = set()
         results = []
-        for a in cards:
+        for a in soup.select("a[href^='/asset/']"):
             href = a.get("href", "")
-            if href in seen:
+            if href in seen or not self._is_asset_href(href):
                 continue
             seen.add(href)
-            # Wrap the anchor to reuse the card parser.
             results.append(self._parse_asset_card(a.parent or a))
+        return results
+
+    async def list_publisher_assets(self, publisher: str) -> dict[str, Any]:
+        soup, final_url = await self._get_html(f"/publisher/{publisher}/")
+        results = self._scrape_asset_links(soup)
         return {"publisher": publisher, "results": results, "source_url": final_url}
+
+    async def list_my_uploads(self) -> dict[str, Any]:
+        """List the signed-in user's own assets, including drafts.
+
+        Uses /my_uploads/ — the authenticated "manage your uploads" page —
+        rather than the public /publisher/<slug>/ page, which does not surface
+        drafts or unpublished assets. Requires a valid session.
+        """
+        soup, final_url = await self._get_html("/my_uploads/")
+        results = self._scrape_asset_links(soup)
+        return {"results": results, "count": len(results), "source_url": final_url}
 
     # ------------------------------------------------------- write actions
 
@@ -900,6 +951,212 @@ class AssetStoreClient:
             publisher=publisher,
             slug=slug,
         )
+
+    # ---------------------------------------------------- tickets
+
+    @staticmethod
+    def _parse_ticket_list(soup: BeautifulSoup) -> dict[str, Any]:
+        """Parse /tickets/. The page bundles every tab's content into the same
+        HTML and toggles visibility client-side, so we read each tab's div.
+
+        Returns sections grouped by tab + section heading. Sections whose title
+        suggests closure ("archive", "closed") are flagged ``status="closed"``;
+        everything else is treated as open.
+        """
+
+        def collect(container: Any) -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for section in container.find_all("section"):
+                title_el = section.find(["h1", "h2", "h3"])
+                section_title = title_el.get_text(strip=True) if title_el else ""
+                status = (
+                    "closed"
+                    if any(word in section_title.lower() for word in ("archive", "closed"))
+                    else "open"
+                )
+                for div in section.find_all("div", recursive=False):
+                    link = div.find("a", href=lambda h: h and h.startswith("/ticket/"))
+                    if not link:
+                        continue
+                    href = link["href"]
+                    parts = [p for p in href.split("/") if p]
+                    tid = parts[1] if len(parts) >= 2 and parts[0] == "ticket" else None
+                    sender = ""
+                    br = link.find_next("br")
+                    if br and br.next_sibling:
+                        sender = str(br.next_sibling).strip()
+                    out.append(
+                        {
+                            "id": tid,
+                            "url": href,
+                            "title": link.get_text(strip=True),
+                            "sender": sender,
+                            "status": status,
+                            "section": section_title,
+                        }
+                    )
+            return out
+
+        user_tab = soup.find(id="user-tickets")
+        mod_tab = soup.find(id="moderation-tickets")
+        return {
+            "user_tickets": collect(user_tab) if user_tab else [],
+            "moderation_tickets": collect(mod_tab) if mod_tab else [],
+        }
+
+    async def list_tickets(self) -> dict[str, Any]:
+        soup, final_url = await self._get_html("/tickets/")
+        if "/tickets/" not in final_url:
+            raise StoreError(401, "Not authenticated; /tickets/ redirected away.")
+        parsed = self._parse_ticket_list(soup)
+        return {"source_url": final_url, **parsed}
+
+    @staticmethod
+    def _parse_ticket_detail(soup: BeautifulSoup) -> dict[str, Any]:
+        title_el = soup.select_one("h1.ticket-title")
+        created_el = soup.select_one("time.ticket-creation")
+        related_el = soup.select_one(".referenced-asset .related-asset a")
+        related: dict[str, Any] | None = None
+        if related_el:
+            related = {
+                "name": related_el.get_text(strip=True),
+                "url": related_el.get("href"),
+            }
+
+        # Status: if the "ticket-closed" panel rendered, the ticket is closed;
+        # otherwise look at the action button.
+        closed_panel = soup.find(id="ticket-closed")
+        if closed_panel is not None:
+            status = "closed"
+        else:
+            action_input = soup.select_one(
+                "#ticket-action-open-close input[name='action']"
+            )
+            action_value = action_input.get("value") if action_input else None
+            # The button reads "Close ticket" → ticket is currently open;
+            # "Reopen ticket" → ticket is currently closed.
+            status = "closed" if action_value == "reopen" else "open"
+
+        messages: list[dict[str, Any]] = []
+        chat = soup.find(id="chat")
+        if chat:
+            for container in chat.select(".messages-container"):
+                sender_el = container.select_one(".messages-sender-name")
+                sender = sender_el.get_text(strip=True) if sender_el else ""
+                sender_id = container.get("data-sender-id")
+                for msg in container.select(".messages .message"):
+                    timestamp = msg.get("data-timestamp") or msg.get("title")
+                    messages.append(
+                        {
+                            "sender": sender,
+                            "sender_id": sender_id,
+                            "timestamp": timestamp,
+                            "text": msg.get_text("\n", strip=True),
+                            "html": "".join(str(c) for c in msg.children),
+                        }
+                    )
+
+        return {
+            "title": title_el.get_text(strip=True) if title_el else None,
+            "created_at": created_el.get("datetime") if created_el else None,
+            "related_asset": related,
+            "status": status,
+            "messages": messages,
+        }
+
+    async def get_ticket(self, ticket_id: int | str) -> dict[str, Any]:
+        soup, final_url = await self._get_html(f"/ticket/{ticket_id}/")
+        if f"/ticket/{ticket_id}/" not in final_url:
+            raise StoreError(404, f"ticket {ticket_id} not found or not visible.")
+        return {"id": str(ticket_id), "url": final_url, **self._parse_ticket_detail(soup)}
+
+    async def create_ticket(self, title: str, message: str) -> dict[str, Any]:
+        """POST the /tickets/ form to open a support request.
+
+        The form has no CSRF token and no enctype declared; it submits as
+        application/x-www-form-urlencoded. On success the server typically
+        redirects (302). On validation failure it re-renders /tickets/ with
+        the same form values.
+        """
+        client = self._ensure_client()
+        url = urljoin(self.base_url + "/", "tickets/")
+        response = await client.post(
+            url,
+            data={"title": title, "message": message},
+            headers={"Referer": url},
+            follow_redirects=False,
+        )
+        # Successful submit redirects; if it returns 200, the form rendered
+        # again — likely a validation error.
+        if response.status_code in (301, 302, 303):
+            redirect_to = response.headers.get("location", "")
+            if redirect_to.startswith("/"):
+                redirect_to = urljoin(self.base_url + "/", redirect_to.lstrip("/"))
+            return {
+                "created": True,
+                "status": response.status_code,
+                "redirect_to": redirect_to,
+            }
+        if response.status_code >= 400:
+            raise StoreError(response.status_code, response.text[:300])
+        # 200 OK with form re-rendered: surface inline errors if any.
+        errors = self._form_errors(response.text)
+        raise StoreError(
+            response.status_code,
+            "Ticket creation rejected: "
+            + ("; ".join(errors) or "no error message in response"),
+        )
+
+    async def reply_ticket(self, ticket_id: int | str, message: str) -> dict[str, Any]:
+        client = self._ensure_client()
+        url = urljoin(self.base_url + "/", f"ticket/{ticket_id}/reply/")
+        referer = urljoin(self.base_url + "/", f"ticket/{ticket_id}/")
+        response = await client.post(
+            url,
+            data={"message": message, "action": "reply"},
+            headers={"Referer": referer, "HX-Request": "true"},
+            follow_redirects=False,
+        )
+        if response.status_code >= 400:
+            errors = self._form_errors(response.text)
+            raise StoreError(
+                response.status_code,
+                "; ".join(errors) or response.text[:300] or "reply rejected",
+            )
+        return {"ok": True, "status": response.status_code, "ticket_id": str(ticket_id)}
+
+    async def set_ticket_status(
+        self, ticket_id: int | str, action: str
+    ) -> dict[str, Any]:
+        """Close or reopen a ticket.
+
+        ``action`` must be ``"close"`` or ``"reopen"``. The server only accepts
+        the action that matches the ticket's current state — closing a closed
+        ticket (or reopening an open one) returns an HTTP error.
+        """
+        if action not in ("close", "reopen"):
+            raise StoreError(400, f"invalid action {action!r}; expected close or reopen")
+        client = self._ensure_client()
+        url = urljoin(self.base_url + "/", f"ticket/{ticket_id}/action/")
+        referer = urljoin(self.base_url + "/", f"ticket/{ticket_id}/")
+        response = await client.post(
+            url,
+            data={"action": action},
+            headers={"Referer": referer, "HX-Request": "true"},
+            follow_redirects=False,
+        )
+        if response.status_code >= 400:
+            errors = self._form_errors(response.text)
+            raise StoreError(
+                response.status_code,
+                "; ".join(errors) or response.text[:300] or f"{action} rejected",
+            )
+        return {
+            "ok": True,
+            "status": response.status_code,
+            "ticket_id": str(ticket_id),
+            "action": action,
+        }
 
     async def resolve_download_url(
         self, publisher: str, slug: str, download_id: str | None = None

@@ -19,9 +19,12 @@ asset marketplaces:
 
 - Search both marketplaces with sensible defaults (e.g. Godot 4.6 instead of
   the legacy 2.1 default the old API uses).
-- Authenticate via a local CLI (`getpass`-prompted) so passwords never reach
-  the LLM transcript. Environment variables and direct tool args are also
-  supported.
+- Authenticate by calling the login tool with no arguments: if your MCP client
+  supports [MCP elicitation] it prompts you for username and password, so they
+  are typed by you and never reach the LLM transcript. Clients without
+  elicitation (e.g. Claude Code) can authenticate out of band via the
+  `godot-store-mcp login` / `login-store` CLI subcommands or environment
+  variables — see [Authentication](#authentication).
 - Publish workflow on the new store: create a draft, edit settings, upload
   thumbnails/screenshots, upload version zips, set pricing, submit for review.
 - Stream downloads with optional sha256 verification.
@@ -73,30 +76,51 @@ For Claude Desktop the config lives at:
 - Linux — `~/.config/Claude/claude_desktop_config.json`
 - Windows — `%APPDATA%\Claude\claude_desktop_config.json`
 
-## Authenticate
+## Authentication
 
 Both marketplaces are read-only for browsing — auth is only needed for write
 actions (publishing, downloading paid assets, library management).
 
-The recommended flow is to authenticate **once** via the CLI so your password
-never appears in the LLM transcript:
-
-```bash
-godot-store-mcp login         # old asset library
-godot-store-mcp login-store   # new asset store (Keycloak OIDC)
-```
-
 Credentials are saved to `~/.config/godot-store-mcp/credentials.json`
 (chmod 600). Override the location with `GODOT_STORE_MCP_CONFIG=/path/to/file.json`.
 
-Alternatives:
+Pick whichever path your MCP client supports, in order of preference:
 
-- Set credentials in the server's environment:
-  - `GODOT_ASSET_LIBRARY_USERNAME` / `GODOT_ASSET_LIBRARY_PASSWORD` — old library.
-  - `GODOT_ASSET_STORE_USERNAME`   / `GODOT_ASSET_STORE_PASSWORD`   — new store.
-- Call `library_login` / `store_login` with arguments (last resort — leaks the
-  password into the LLM transcript).
-- Paste an existing session cookie via `store_set_session_cookie`.
+**1. In-client secure prompt (clients with elicitation support).** Call
+`library_login` (old library) or `store_login` (new store) with no arguments.
+Your client prompts you for username and password through its secure input form
+via [MCP elicitation], so they are typed by you and never pass through the
+assistant or the LLM transcript.
+
+**2. Out-of-band CLI (recommended for clients without elicitation, e.g. Claude
+Code).** Run the login subcommand in your own terminal — it prompts via
+`getpass` and saves the token / session cookie locally; the LLM never sees your
+password:
+
+```bash
+godot-store-mcp login         # old asset library (godotengine.org/asset-library)
+godot-store-mcp login-store   # new asset store (store.godotengine.org, OIDC)
+```
+
+**3. Environment variables.** Set these in the MCP server's environment, then
+call `library_login` / `store_login` with no arguments:
+
+```bash
+GODOT_ASSET_LIBRARY_USERNAME / GODOT_ASSET_LIBRARY_PASSWORD   # old library
+GODOT_ASSET_STORE_USERNAME   / GODOT_ASSET_STORE_PASSWORD     # new store
+```
+
+**4. Other fallbacks.**
+
+- New store: `store_login_browser` opens a Chromium window to sign in (also
+  handles reCAPTCHA / 2FA / password resets), or paste an existing `session`
+  cookie via `store_set_session_cookie`.
+- Old library: obtain a token out of band and save it with `library_set_token`.
+
+> Passing `username`/`password` directly as tool arguments works too, but they
+> land in the LLM transcript — use only as a last resort.
+
+[MCP elicitation]: https://modelcontextprotocol.io/specification/draft/client/elicitation
 
 ## Tools
 
@@ -136,6 +160,11 @@ Alternatives:
 | `store_suggest_tags` | Query the tag autocomplete to find canonical slugs. |
 | `store_submit_for_review` | Submit a draft to moderators (equivalent to clicking Publish). |
 | `store_add_to_library` / `store_remove_from_library` | Library management on the new store. |
+| `store_list_tickets` | List support tickets visible to you (own + publisher; mod queue if you're a mod). |
+| `store_get_ticket` | Fetch one ticket's message thread by numeric id. |
+| `store_create_ticket` | Open a generic support ticket (the "Submit request" form). |
+| `store_reply_ticket` | Post a reply on an open ticket. |
+| `store_close_ticket` / `store_reopen_ticket` | Toggle a ticket's status. |
 | `store_download_asset` | Stream a specific version's zip from the CDN (or the in-store endpoint). |
 
 ## Beta caveats (new store)

@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
-from pydantic import Field
+from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel, Field
 
 from godot_store_mcp import config
 from godot_store_mcp.download import stream_download
@@ -17,13 +17,27 @@ ENV_USERNAME = "GODOT_ASSET_LIBRARY_USERNAME"
 ENV_PASSWORD = "GODOT_ASSET_LIBRARY_PASSWORD"
 
 _CREDENTIALS_REQUIRED_HINT = (
-    "No credentials available. To log in without exposing your password to the "
-    "assistant, ask the user to run\n"
+    "No credentials available and this MCP client can't prompt for them securely. "
+    "To log in without exposing your password to the assistant, ask the user to run\n"
     "    godot-store-mcp login\n"
     "in their terminal — it prompts via getpass and saves the token locally. "
     f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
-    "environment and call this tool again with no arguments."
+    "environment and call this tool again, or save a token via library_set_token."
 )
+
+
+class _LibraryLoginInput(BaseModel):
+    username: str = Field(description="Your godotengine.org/asset-library username.")
+    # NOTE: MCP elicitation only permits string `format` values of
+    # email/uri/date/date-time (per the restricted schema in the spec). A
+    # `format: "password"` hint makes clients reject the whole elicitation
+    # request, so we leave this as a plain string.
+    password: str = Field(
+        description=(
+            "Your asset-library password. Entered directly in your MCP client's "
+            "input form; it is never shared with the assistant."
+        ),
+    )
 
 
 def _require_token() -> str:
@@ -152,26 +166,28 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name="library_login",
         description=(
-            "Authenticate to the old asset library and persist the returned token "
-            "locally. Subsequent write tools (edits, delete, review) use this token "
-            "automatically.\n\n"
-            "PREFERRED: do NOT ask the user for their password. Instead, instruct "
-            "them to run\n"
+            "Authenticate to the old asset library (godotengine.org/asset-library) "
+            "and persist the returned token locally. Subsequent write tools (edits, "
+            "delete, review) use this token automatically.\n\n"
+            "PREFERRED: do NOT ask the user for their password. If your client "
+            "supports interactive elicitation the tool prompts securely in-client. "
+            "Otherwise instruct the user to run\n"
             "    godot-store-mcp login\n"
             "in their terminal — credentials are prompted via getpass and never "
             f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
-            "MCP server's environment and call this tool with no arguments. "
-            "Passing username/password as tool arguments still works but exposes "
-            "them to the LLM transcript — last resort only."
+            "MCP server's environment and call this tool with no arguments. Passing "
+            "username/password as tool arguments still works but exposes them to the "
+            "LLM transcript — last resort only."
         ),
     )
     async def library_login(
+        ctx: Context,
         username: Annotated[
             str | None,
             Field(
                 description=(
-                    "Optional. Omit to read from "
-                    f"{ENV_USERNAME} or to prompt the user to run the CLI."
+                    f"Optional. Omit to read from {ENV_USERNAME}, to prompt in-client "
+                    "(if supported), or to fall back to the CLI."
                 ),
             ),
         ] = None,
@@ -179,19 +195,40 @@ def register(mcp: FastMCP) -> None:
             str | None,
             Field(
                 description=(
-                    "Optional. Omit to read from "
-                    f"{ENV_PASSWORD} or to prompt the user to run the CLI."
+                    f"Optional. Omit to read from {ENV_PASSWORD}, to prompt in-client "
+                    "(if supported), or to fall back to the CLI."
                 ),
             ),
         ] = None,
     ) -> dict:
         resolved_user, resolved_pwd = _resolve_credentials(username, password)
-        if not resolved_user or not resolved_pwd:
+
+        # No explicit args / env vars — try the client's secure prompt.
+        if not (resolved_user and resolved_pwd):
+            try:
+                elicited = await ctx.elicit(
+                    message="Sign in to the Godot asset library (godotengine.org/asset-library).",
+                    schema=_LibraryLoginInput,
+                )
+            except Exception:  # client lacks elicitation support — fall through to hint
+                elicited = None
+            if elicited is not None:
+                if elicited.action != "accept" or elicited.data is None:
+                    return {
+                        "error": True,
+                        "kind": "cancelled",
+                        "message": f"Login {elicited.action}; no credentials submitted.",
+                    }
+                resolved_user = elicited.data.username
+                resolved_pwd = elicited.data.password
+
+        if not (resolved_user and resolved_pwd):
             return {
                 "error": True,
                 "kind": "credentials_required",
                 "message": _CREDENTIALS_REQUIRED_HINT,
             }
+
         async with AssetLibraryClient() as c:
             try:
                 result = await c.login(resolved_user, resolved_pwd)

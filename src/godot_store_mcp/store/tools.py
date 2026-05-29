@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urljoin
 
-from mcp.server.fastmcp import FastMCP
-from pydantic import Field
+from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel, Field
 
 from godot_store_mcp import config
 from godot_store_mcp.download import stream_download
@@ -21,13 +21,28 @@ ENV_USERNAME = "GODOT_ASSET_STORE_USERNAME"
 ENV_PASSWORD = "GODOT_ASSET_STORE_PASSWORD"
 
 _CREDENTIALS_REQUIRED_HINT = (
-    "No credentials available. To log in without exposing your password to the "
-    "assistant, ask the user to run\n"
+    "No credentials available and this MCP client can't prompt for them securely. "
+    "To log in without exposing your password to the assistant, ask the user to run\n"
     "    godot-store-mcp login-store\n"
     "in their terminal — it prompts via getpass and saves the session cookie locally. "
     f"Alternatively, set {ENV_USERNAME} and {ENV_PASSWORD} in the MCP server's "
-    "environment and call this tool again with no arguments."
+    "environment and call this tool again, or paste a cookie via "
+    "store_set_session_cookie."
 )
+
+
+class _StoreLoginInput(BaseModel):
+    username: str = Field(description="Your store.godotengine.org username or email.")
+    # NOTE: MCP elicitation only permits string `format` values of
+    # email/uri/date/date-time (per the restricted schema in the spec). A
+    # `format: "password"` hint makes clients reject the whole elicitation
+    # request, so we leave this as a plain string.
+    password: str = Field(
+        description=(
+            "Your store password. Entered directly in your MCP client's input form; "
+            "it is never shared with the assistant."
+        ),
+    )
 
 
 def _handle(err: StoreError) -> dict[str, Any]:
@@ -99,6 +114,22 @@ def register(mcp: FastMCP) -> None:
             except StoreError as e:
                 return _handle(e)
 
+    @mcp.tool(
+        name="store_list_my_uploads",
+        description=(
+            "List the signed-in user's own assets (including unpublished "
+            "drafts) from the authenticated /my_uploads/ page. Requires login. "
+            "Use this — not store_list_publisher_assets — to find assets you "
+            "manage; the public publisher page omits drafts."
+        ),
+    )
+    async def store_list_my_uploads() -> dict:
+        async with _client_from_creds() as c:
+            try:
+                return await c.list_my_uploads()
+            except StoreError as e:
+                return _handle(e)
+
     # ---------------------------------------------------------------- auth
 
     @mcp.tool(
@@ -108,23 +139,25 @@ def register(mcp: FastMCP) -> None:
             "No browser required. If Keycloak demands reCAPTCHA, 2FA, or another "
             "interactive step, the tool returns an error pointing to "
             "`store_login_browser`.\n\n"
-            "PREFERRED: do NOT ask the user for their password. Instead, instruct "
-            "them to run\n"
+            "PREFERRED: do NOT ask the user for their password. If your client "
+            "supports interactive elicitation the tool prompts securely in-client. "
+            "Otherwise instruct the user to run\n"
             "    godot-store-mcp login-store\n"
             "in their terminal — credentials are prompted via getpass and never "
             f"reach the assistant. Or set {ENV_USERNAME} and {ENV_PASSWORD} in the "
-            "MCP server's environment and call this tool with no arguments. "
-            "Passing username/password as tool arguments still works but exposes "
-            "them to the LLM transcript — last resort only."
+            "MCP server's environment and call this tool with no arguments. Passing "
+            "username/password as tool arguments still works but exposes them to the "
+            "LLM transcript — last resort only."
         ),
     )
     async def store_login(
+        ctx: Context,
         username: Annotated[
             str | None,
             Field(
                 description=(
-                    "Optional. Omit to read from "
-                    f"{ENV_USERNAME} or to prompt the user to run the CLI."
+                    f"Optional. Omit to read from {ENV_USERNAME}, to prompt in-client "
+                    "(if supported), or to fall back to the CLI."
                 ),
             ),
         ] = None,
@@ -132,8 +165,8 @@ def register(mcp: FastMCP) -> None:
             str | None,
             Field(
                 description=(
-                    "Optional. Omit to read from "
-                    f"{ENV_PASSWORD} or to prompt the user to run the CLI."
+                    f"Optional. Omit to read from {ENV_PASSWORD}, to prompt in-client "
+                    "(if supported), or to fall back to the CLI."
                 ),
             ),
         ] = None,
@@ -146,7 +179,27 @@ def register(mcp: FastMCP) -> None:
         )
 
         resolved_user, resolved_pwd = _resolve_credentials(username, password)
-        if not resolved_user or not resolved_pwd:
+
+        # No explicit args / env vars — try the client's secure prompt.
+        if not (resolved_user and resolved_pwd):
+            try:
+                elicited = await ctx.elicit(
+                    message="Sign in to the new Godot Asset Store (store.godotengine.org).",
+                    schema=_StoreLoginInput,
+                )
+            except Exception:  # client lacks elicitation support — fall through to hint
+                elicited = None
+            if elicited is not None:
+                if elicited.action != "accept" or elicited.data is None:
+                    return {
+                        "error": True,
+                        "kind": "cancelled",
+                        "message": f"Login {elicited.action}; no credentials submitted.",
+                    }
+                resolved_user = elicited.data.username
+                resolved_pwd = elicited.data.password
+
+        if not (resolved_user and resolved_pwd):
             return {
                 "error": True,
                 "kind": "credentials_required",
@@ -548,6 +601,130 @@ def register(mcp: FastMCP) -> None:
         async with AssetStoreClient(session_cookie=cookie) as c:
             try:
                 return await c.submit_for_review(publisher, slug)
+            except StoreError as e:
+                return _handle(e)
+
+    # ------------------------------------------------------------- tickets
+
+    @mcp.tool(
+        name="store_list_tickets",
+        description=(
+            "List the support tickets visible to the logged-in user on the new store "
+            "(/tickets/). Returns separate `user_tickets` (own + publisher tickets) and "
+            "`moderation_tickets` (only populated for moderators). Each entry includes "
+            "id, url, title, sender username, status ('open' or 'closed') and the section "
+            "heading it appeared under. Requires login."
+        ),
+    )
+    async def store_list_tickets() -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.list_tickets()
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_get_ticket",
+        description=(
+            "Fetch the detail page for a single support ticket by numeric id. Returns "
+            "title, creation timestamp, related asset (if any), status, and the full "
+            "message thread (sender, timestamp, text). Requires login."
+        ),
+    )
+    async def store_get_ticket(
+        ticket_id: Annotated[
+            int, Field(description="Numeric ticket id (the N in /ticket/N/).")
+        ],
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.get_ticket(ticket_id)
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_create_ticket",
+        description=(
+            "Open a new support ticket on the new store (the 'Submit request' form at "
+            "/tickets/#new-ticket). Requires login. This is the generic support flow — "
+            "asset-specific 'Regarding asset: ...' tickets are created by moderators "
+            "from their moderation queue, not by users via this form."
+        ),
+    )
+    async def store_create_ticket(
+        title: Annotated[str, Field(description="Ticket title / subject line.")],
+        message: Annotated[str, Field(description="Body of the ticket.")],
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.create_ticket(title=title, message=message)
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_reply_ticket",
+        description=(
+            "Post a reply on an open support ticket. Closed tickets reject replies — "
+            "reopen first via store_reopen_ticket. Requires login."
+        ),
+    )
+    async def store_reply_ticket(
+        ticket_id: Annotated[int, Field(description="Numeric ticket id.")],
+        message: Annotated[str, Field(description="Reply body.")],
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.reply_ticket(ticket_id, message)
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_close_ticket",
+        description=(
+            "Close an open support ticket. The store rejects closing an already-closed "
+            "ticket. Requires login."
+        ),
+    )
+    async def store_close_ticket(
+        ticket_id: Annotated[int, Field(description="Numeric ticket id.")],
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.set_ticket_status(ticket_id, "close")
+            except StoreError as e:
+                return _handle(e)
+
+    @mcp.tool(
+        name="store_reopen_ticket",
+        description=(
+            "Reopen a previously-closed support ticket so replies can be posted again. "
+            "Requires login."
+        ),
+    )
+    async def store_reopen_ticket(
+        ticket_id: Annotated[int, Field(description="Numeric ticket id.")],
+    ) -> dict:
+        cookie = config.load().store.session_cookie
+        if not cookie:
+            return {"error": True, "message": "Not logged in. Call store_login first."}
+        async with AssetStoreClient(session_cookie=cookie) as c:
+            try:
+                return await c.set_ticket_status(ticket_id, "reopen")
             except StoreError as e:
                 return _handle(e)
 
